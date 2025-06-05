@@ -1,0 +1,3 @@
+[build]
+# Add system-level packages required by OpenCV
+packages = ["libGL", "libglib-2.0", "ffmpeg"]
