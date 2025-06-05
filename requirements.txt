@@ -1,0 +1,7 @@
+python-telegram-bot==20.3
+pytesseract
+opencv-python
+Pillow
+requests
+httpx
+apscheduler
