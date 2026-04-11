@@ -1,0 +1,755 @@
+//+------------------------------------------------------------------+
+//|  OneHour_ORB_Gann_EA_v2.mq5                                        |
+//|  Multi-symbol 1H ORB + Gann + ATR buffer                        |
+//+------------------------------------------------------------------+
+#property strict
+#property copyright ""
+#property version   "1.00"
+
+//--- inputs
+input string InpSymbols         = "EURUSD.raw";
+input double InpBaseRiskPercent = 8.0;
+input int    InpMagic           = 123456;
+input bool   InpEnableOpposite  = true;
+input bool   InpUseM1Confirm    = false;
+
+// Time / session inputs (simplified)
+input int  InpIstOffset330 = 7;      // 9:30 IST = 7:00 server (3:30 window)
+input int  InpIstOffset230 = 6;      // 9:30 IST = 6:00 server (2:30 window)
+input bool InpIs330Window  = true;   // manually toggle if regime switches
+
+// Constants
+#define ORB_ATR_PERIOD 14
+
+//--- per-symbol state
+struct SSymbolState
+  {
+   string   name;
+   bool     day_processed;
+   datetime day_date;
+
+   // ORB + breakout (placeholder)
+   double   orb_high;
+   double   orb_low;
+   int      orb_mark_shift;
+   bool     is_new_orb_shifted;
+
+   bool     have_breakout;
+   int      breakout_side;        // +1 BUY, -1 SELL
+   datetime breakout_time;
+   double   breakout_input_price;
+
+   // Gann setups
+   bool     primary_active;
+   double   primary_entry;
+   double   primary_sl;
+   double   primary_tp;
+   double   primary_lot;
+
+   bool     opp_active;
+   double   opp_entry;
+   double   opp_sl;
+   double   opp_tp;
+   double   opp_lot;
+
+   bool     primary_filled;
+   bool     opp_filled;
+
+   bool     tp_reduced;
+   double   original_tp;
+   double   original_entry;
+   int      trade_ticket;
+  };
+
+//--- globals
+string       g_symbols[];
+SSymbolState g_state[];
+
+double g_gann_prices[];
+double g_buy_at[];
+double g_buy_t1[];
+double g_buy_t2[];
+double g_sell_at[];
+double g_sell_t1[];
+double g_sell_t2[];
+
+MqlTick g_tick;
+
+//+------------------------------------------------------------------+
+//| StrategyCalculator port                                          |
+//+------------------------------------------------------------------+
+double GetPipValuePerLot(string pair,double price)
+  {
+   string p = pair;
+   p = StringToUpper(p);
+   StringReplace(p,"/","");
+   StringReplace(p,"_","");
+   int len = StringLen(p);
+
+   // XXXUSD (quote USD)
+   if(len >= 3 && StringSubstr(p, len - 3, 3) == "USD")
+      return(10.0);
+
+   // XXXJPY (quote JPY)
+   if(len >= 3 && StringSubstr(p, len - 3, 3) == "JPY")
+      return((0.01/price) * 100000.0);
+
+   // USDXXX (base USD)
+   if(len >= 3 && StringSubstr(p, 0, 3) == "USD")
+      return((0.0001/price) * 100000.0);
+
+   return(10.0);
+  }
+
+int RoundoffPips(double pips)
+  {
+   return((int)MathFloor(pips));
+  }
+
+double CalcT15(double t1,double t2)
+  {
+   return((t1+t2)/2.0);
+  }
+
+int CalcSlSizingT15(double t15,double t1)
+  {
+   double diff = MathAbs(t15-t1);
+   double pips = (diff/5.0)/0.0001;
+   return(RoundoffPips(pips));
+  }
+
+int CalcSlSizingT1(double t1,double at)
+  {
+   double diff = MathAbs(t1-at);
+   double pips = (diff/6.0)/0.0001;
+   return(RoundoffPips(pips));
+  }
+
+int CalcTpPips(int sl_pips)
+  {
+   return(sl_pips*2);  // 1:2 RR
+  }
+
+double CalcLotSize(double fund,double risk_percent,int sl_pips,string pair,double entry)
+  {
+   if(fund<=0 || sl_pips<=0)
+      return(0.01);
+   double risk_amount = fund*(risk_percent/100.0);
+   double pip_value   = GetPipValuePerLot(pair,entry);
+   double lot         = risk_amount/(sl_pips*pip_value);
+   if(lot<0.01) lot = 0.01;
+   return(NormalizeDouble(lot,2));
+  }
+
+// BUY primary
+void GetBuyBoPrimary(int gidx,double fund,double risk_percent,string pair,
+                     double &entry,double &sl,double &tp,double &lot)
+  {
+   double buy_t1  = g_buy_t1[gidx];
+   double buy_t2  = g_buy_t2[gidx];
+   double sell_t1 = g_sell_t1[gidx];
+
+   entry = CalcT15(buy_t1,buy_t2);
+   int sl_pips = CalcSlSizingT15(entry,buy_t1);
+   int tp_pips = CalcTpPips(sl_pips);
+
+   sl  = sell_t1;
+   tp  = entry + tp_pips*0.0001;
+   lot = CalcLotSize(fund,risk_percent,sl_pips,pair,entry);
+  }
+
+// BUY opp SELL
+void GetBuyBoOppSell(int gidx,double fund,double risk_percent,string pair,
+                     double &entry,double &sl,double &tp,double &lot)
+  {
+   double sell_t1 = g_sell_t1[gidx];
+   double buy_t1  = g_buy_t1[gidx];
+
+   entry = sell_t1;
+   int sl_pips = CalcSlSizingT1(sell_t1,g_sell_at[gidx]);
+   int tp_pips = CalcTpPips(sl_pips);
+
+   sl  = buy_t1;
+   tp  = entry - tp_pips*0.0001;
+   lot = CalcLotSize(fund,risk_percent,sl_pips,pair,entry);
+  }
+
+// SELL primary
+void GetSellBoPrimary(int gidx,double fund,double risk_percent,string pair,
+                      double &entry,double &sl,double &tp,double &lot)
+  {
+   double sell_t1 = g_sell_t1[gidx];
+   double sell_t2 = g_sell_t2[gidx];
+   double buy_t1  = g_buy_t1[gidx];
+
+   entry = CalcT15(sell_t1,sell_t2);
+   int sl_pips = CalcSlSizingT15(entry,sell_t1);
+   int tp_pips = CalcTpPips(sl_pips);
+
+   sl  = buy_t1;
+   tp  = entry - tp_pips*0.0001;
+   lot = CalcLotSize(fund,risk_percent,sl_pips,pair,entry);
+  }
+
+// SELL opp BUY
+void GetSellBoOppBuy(int gidx,double fund,double risk_percent,string pair,
+                     double &entry,double &sl,double &tp,double &lot)
+  {
+   double buy_t1  = g_buy_t1[gidx];
+   double sell_t1 = g_sell_t1[gidx];
+
+   entry = buy_t1;
+   int sl_pips = CalcSlSizingT1(buy_t1,g_buy_at[gidx]);
+   int tp_pips = CalcTpPips(sl_pips);
+
+   sl  = sell_t1;
+   tp  = entry + tp_pips*0.0001;
+   lot = CalcLotSize(fund,risk_percent,sl_pips,pair,entry);
+  }
+
+//+------------------------------------------------------------------+
+//| Gann lookup: nearest index                                       |
+//+------------------------------------------------------------------+
+int GetGannIndex(double price)
+  {
+   int n = ArraySize(g_gann_prices);
+   if(n<=0) return(-1);
+
+   int left=0,right=n-1;
+   while(left<=right)
+     {
+      int mid=(left+right)/2;
+      double v=g_gann_prices[mid];
+      if(v==price) return(mid);
+      if(v<price)  left=mid+1;
+      else         right=mid-1;
+     }
+   int idx = MathMax(0,MathMin(n-1,left));
+   if(idx>0 && idx<n)
+     {
+      double before = g_gann_prices[idx-1];
+      double after  = g_gann_prices[idx];
+      if(MathAbs(price-before)<=MathAbs(price-after))
+         idx = idx-1;
+     }
+   return(idx);
+  }
+
+//+------------------------------------------------------------------+
+//| Load Gann CSV (forex_gann_lookup_1_3.csv in MQL5/Files)          |
+//+------------------------------------------------------------------+
+bool LoadGannLookup()
+  {
+   // RESOURCE se file open
+   int handle = FileOpen("forex_gann_lookup_1_3.csv",
+                      FILE_READ | FILE_CSV | FILE_ANSI | FILE_COMMON,
+                      ',');
+   if(handle == INVALID_HANDLE)
+     {
+      Print("LoadGannLookup RESOURCE FAILED err=", GetLastError());
+      return(false);
+     }
+
+   // ---------- header skip ----------
+   FileReadString(handle); // price
+   FileReadString(handle); // buy_at
+   FileReadString(handle); // buy_t1
+   FileReadString(handle); // buy_t2
+   FileReadString(handle); // sell_at
+   FileReadString(handle); // sell_t1
+   FileReadString(handle); // sell_t2
+   // ---------------------------------
+
+   double prices_t[];
+   double buy_at_t[],buy_t1_t[],buy_t2_t[];
+   double sell_at_t[],sell_t1_t[],sell_t2_t[];
+
+   int rows = 0;
+   while(!FileIsEnding(handle))
+     {
+      string sp  = FileReadString(handle);
+      if(FileIsEnding(handle)) break;
+      string sba = FileReadString(handle);
+      string sb1 = FileReadString(handle);
+      string sb2 = FileReadString(handle);
+      string ssa = FileReadString(handle);
+      string ss1 = FileReadString(handle);
+      string ss2 = FileReadString(handle);
+
+      double price   = StringToDouble(sp);
+      double buy_at  = StringToDouble(sba);
+      double buy_t1  = StringToDouble(sb1);
+      double buy_t2  = StringToDouble(sb2);
+      double sell_at = StringToDouble(ssa);
+      double sell_t1 = StringToDouble(ss1);
+      double sell_t2 = StringToDouble(ss2);
+
+      int n = ArraySize(prices_t);
+      ArrayResize(prices_t,  n+1);
+      ArrayResize(buy_at_t,  n+1);
+      ArrayResize(buy_t1_t,  n+1);
+      ArrayResize(buy_t2_t,  n+1);
+      ArrayResize(sell_at_t, n+1);
+      ArrayResize(sell_t1_t, n+1);
+      ArrayResize(sell_t2_t, n+1);
+
+      prices_t[n]  = price;
+      buy_at_t[n]  = buy_at;
+      buy_t1_t[n]  = buy_t1;
+      buy_t2_t[n]  = buy_t2;
+      sell_at_t[n] = sell_at;
+      sell_t1_t[n] = sell_t1;
+      sell_t2_t[n] = sell_t2;
+      rows++;
+     }
+
+   FileClose(handle);
+
+   if(rows <= 0)
+     {
+      Print("LoadGannLookup: no rows");
+      return(false);
+     }
+
+   ArrayResize(g_gann_prices, rows);
+   ArrayResize(g_buy_at,      rows);
+   ArrayResize(g_buy_t1,      rows);
+   ArrayResize(g_buy_t2,      rows);
+   ArrayResize(g_sell_at,     rows);
+   ArrayResize(g_sell_t1,     rows);
+   ArrayResize(g_sell_t2,     rows);
+
+   for(int i=0; i<rows; i++)
+     {
+      g_gann_prices[i] = prices_t[i];
+      g_buy_at[i]      = buy_at_t[i];
+      g_buy_t1[i]      = buy_t1_t[i];
+      g_buy_t2[i]      = buy_t2_t[i];
+      g_sell_at[i]     = sell_at_t[i];
+      g_sell_t1[i]     = sell_t1_t[i];
+      g_sell_t2[i]     = sell_t2_t[i];
+     }
+
+   Print("LoadGannLookup: loaded ", rows, " rows");
+   return(true);
+  }
+//+------------------------------------------------------------------+
+//| ATR + candle touch                                               |
+//+------------------------------------------------------------------+
+double GetAtrForBar(string symbol,int shift)
+  {
+   int handle = iATR(symbol,PERIOD_H1,ORB_ATR_PERIOD);
+   if(handle==INVALID_HANDLE) return(0.0);
+   double buf[];
+   if(CopyBuffer(handle,0,shift,1,buf)!=1) return(0.0);
+   return(buf[0]);
+  }
+
+double CheckAtrBufferTouch(string symbol,int shift,double entry,int side,bool is_new_orb_shifted)
+  {
+   MqlRates rt[];
+   if(CopyRates(symbol,PERIOD_H1,shift,1,rt)!=1) return(0.0);
+   double high = rt[0].high;
+   double low  = rt[0].low;
+
+   double atr = GetAtrForBar(symbol,shift);
+   if(atr<=0.0) return(0.0);
+
+   double buffer_val;
+   if(is_new_orb_shifted)
+     {
+      buffer_val = (atr<0.00150)?atr/5.0:atr/7.0;
+     }
+   else
+     {
+      buffer_val = (atr<0.00150)?atr/7.0:atr/10.0;
+     }
+
+   if(side>0)
+     {
+      double trigger = entry + buffer_val;
+      if(high>=trigger) return(NormalizeDouble(trigger,5));
+     }
+   else
+     {
+      double trigger = entry - buffer_val;
+      if(low<=trigger) return(NormalizeDouble(trigger,5));
+     }
+   return(0.0);
+  }
+
+//+------------------------------------------------------------------+
+//| Day helpers                                                      |
+//+------------------------------------------------------------------+
+datetime GetTodayDate(datetime now)
+  {
+   MqlDateTime tm;
+   TimeToStruct(now,tm);
+   tm.hour=0; tm.min=0; tm.sec=0;
+   return(StructToTime(tm));
+  }
+
+bool ValidateDay(string symbol,datetime day_date,int &first_shift,datetime &first_time)
+  {
+   MqlRates rates[];
+   // Get last 72 bars (3 days more than enough)
+   int copied = CopyRates(symbol,PERIOD_H1,0,72,rates);
+   if(copied<=0) return(false);
+
+   // Find first bar whose DATE == day_date
+   first_shift = -1;
+   for(int i=0;i<copied;i++)
+     {
+      MqlDateTime tm;
+      TimeToStruct(rates[i].time,tm);
+      datetime d = rates[i].time; // we compare date only
+      if((datetime)StringToTime(TimeToString(rates[i].time,TIME_DATE)) == day_date)
+        {
+         first_shift = i;
+         first_time  = rates[i].time;
+         break;
+        }
+     }
+
+   if(first_shift==-1)
+     {
+      Print("ValidateDay: no H1 bar found for date ",TimeToString(day_date,TIME_DATE),
+            " sym=",symbol);
+      return(false);
+     }
+
+   double atr = GetAtrForBar(symbol,first_shift);
+   if(atr<=0.0)
+     {
+      Print("ValidateDay: ATR<=0 at first bar for ",symbol);
+      return(false);
+     }
+
+   Print("ValidateDay OK ",symbol," first_bar_time=",TimeToString(first_time),
+         " shift=",first_shift," ATR=",atr);
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Entry window (simplified 7:31–19:30/20:30 IST)                   |
+//+------------------------------------------------------------------+
+bool InEntryWindow(datetime now,datetime day_date)
+  {
+   int offset = InpIs330Window ? InpIstOffset330 : InpIstOffset230;
+   int expiry_hour_ist = InpIs330Window ? 19 : 20;
+
+   MqlDateTime tm;
+   TimeToStruct(day_date,tm);
+   tm.hour = 7; tm.min = 31; tm.sec = 0;
+   datetime ist_start = StructToTime(tm);
+   datetime server_start = ist_start - offset*3600;
+
+   tm.hour = expiry_hour_ist; tm.min = 30; tm.sec = 0;
+   datetime ist_end = StructToTime(tm);
+   datetime server_end = ist_end - offset*3600;
+
+   Print("WINDOW ", 
+         "server_start=", TimeToString(server_start, TIME_MINUTES),
+         " server_end=", TimeToString(server_end, TIME_MINUTES),
+         " now=", TimeToString(now, TIME_MINUTES));
+
+   return(now>=server_start && now<server_end);
+  }
+
+//+------------------------------------------------------------------+
+//| Simple ORB placeholder: use 00:00 high/low, first close breakout |
+//+------------------------------------------------------------------+
+bool DecideSimpleORB(string symbol,datetime day_date,
+                     double &orb_high,double &orb_low,
+                     int &orb_shift,int &side,
+                     datetime &bo_time,double &input_price)
+  {
+   int first_shift;
+   datetime first_time;
+   if(!ValidateDay(symbol,day_date,first_shift,first_time))
+      return(false);
+
+   MqlRates rates[];
+   int copied = CopyRates(symbol,PERIOD_H1,0,72,rates);
+   if(copied<=0) return(false);
+
+   orb_shift = first_shift;
+   orb_high  = rates[orb_shift].high;
+   orb_low   = rates[orb_shift].low;
+
+   // breakout scan from next bar
+   for(int i=orb_shift+1;i<copied;i++)
+     {
+      double c = rates[i].close;
+      if(c>orb_high)
+        {
+         side      = +1;
+         bo_time   = rates[i].time;
+         input_price = rates[i].high;
+         return(true);
+        }
+      if(c<orb_low)
+        {
+         side      = -1;
+         bo_time   = rates[i].time;
+         input_price = rates[i].low;
+         return(true);
+        }
+     }
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| Order helper                                                     |
+//+------------------------------------------------------------------+
+bool OpenMarket(string symbol,int side,double lot,double sl,double tp)
+  {
+   if(!SymbolSelect(symbol,true)) return(false);
+   MqlTick tick;
+   if(!SymbolInfoTick(symbol,tick)) return(false);
+
+   double price = (side>0)?tick.ask:tick.bid;
+   ENUM_ORDER_TYPE type = (side>0)?ORDER_TYPE_BUY:ORDER_TYPE_SELL;
+
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   req.action   = TRADE_ACTION_DEAL;
+   req.symbol   = symbol;
+   req.volume   = lot;
+   req.type     = type;
+   req.price    = price;
+   req.sl       = sl;
+   req.tp       = tp;
+   req.deviation= 20;
+   req.magic    = InpMagic;
+   req.type_filling = ORDER_FILLING_RETURN;
+   req.type_time    = ORDER_TIME_GTC;
+
+   if(!OrderSend(req,res))
+     {
+      Print("OrderSend failed ",symbol," err=",GetLastError());
+      return(false);
+     }
+   if(res.retcode!=TRADE_RETCODE_DONE)
+     {
+      Print("Order retcode!=DONE ",symbol," ret=",res.retcode);
+      return(false);
+     }
+   Print("ORDER OK ",symbol," ticket=",res.order);
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| OnInit                                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   // parse symbols
+   string parts[];
+   int cnt = StringSplit(InpSymbols,'|',parts);
+   if(cnt<=0)
+     {
+      Print("No symbols in InpSymbols");
+      return(INIT_FAILED);
+     }
+
+   ArrayResize(g_symbols,cnt);
+   ArrayResize(g_state,cnt);
+
+   for(int i=0;i<cnt;i++)
+     {
+      g_symbols[i] = parts[i];
+      g_state[i].name = g_symbols[i];
+      g_state[i].day_processed = false;
+      g_state[i].trade_ticket  = -1;
+      g_state[i].primary_active=false;
+      g_state[i].opp_active=false;
+      g_state[i].primary_filled=false;
+      g_state[i].opp_filled=false;
+     }
+
+   if(!LoadGannLookup())
+     {
+      Print("WARNING: Gann not loaded – EA will not trade!");
+     }
+
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| OnTick                                                           |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   datetime now   = TimeCurrent();
+   datetime today = GetTodayDate(now);
+
+   // TODO: existing trade management (multi-day TP reduce) – later
+
+   // Phase 1: per-symbol signal generation
+   for(int i=0;i<ArraySize(g_symbols);i++)
+     {
+      string sym = g_symbols[i];
+      if(sym=="") continue;
+
+      if(g_state[i].day_processed && g_state[i].day_date==today)
+         continue;
+
+      // ✅ NEW: ValidateDay with 4 params
+      int      first_shift;
+      datetime first_time;
+      if(!ValidateDay(sym, today, first_shift, first_time))
+         continue;
+
+      double orb_h,orb_l;
+      int    orb_shift,side;
+      datetime bo_time;
+      double  in_price;
+
+      // Abhi DecideSimpleORB andar se khud CopyRates karega;
+      // agar chaahe to first_shift / first_time yahan use kar sakta hai.
+      if(!DecideSimpleORB(sym,today,orb_h,orb_l,orb_shift,side,bo_time,in_price))
+         continue;
+
+      int gidx = GetGannIndex(in_price);
+      if(gidx<0) continue;
+
+      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+      double risk_percent = InpBaseRiskPercent; // weekly ramp baad me
+
+      double p_entry,p_sl,p_tp,p_lot;
+      double o_entry,o_sl,o_tp,o_lot;
+
+      if(side>0)
+        {
+         GetBuyBoPrimary(gidx,equity,risk_percent,sym,p_entry,p_sl,p_tp,p_lot);
+         if(InpEnableOpposite)
+            GetBuyBoOppSell(gidx,equity,risk_percent,sym,o_entry,o_sl,o_tp,o_lot);
+        }
+      else
+        {
+         GetSellBoPrimary(gidx,equity,risk_percent,sym,p_entry,p_sl,p_tp,p_lot);
+         if(InpEnableOpposite)
+            GetSellBoOppBuy(gidx,equity,risk_percent,sym,o_entry,o_sl,o_tp,o_lot);
+        }
+      
+            Print("SIGNAL ", sym,
+            " side=", side>0 ? "B" : "S",
+            " GannInput=", DoubleToString(in_price,5),
+            " P_Entry=", DoubleToString(p_entry,5),
+            " SL=", DoubleToString(p_sl,5),
+            " TP=", DoubleToString(p_tp,5),
+            " Lot=", DoubleToString(p_lot,2));
+
+      if(InpEnableOpposite)
+         Print("OPP   ", sym,
+               " Entry=", DoubleToString(o_entry,5),
+               " SL=", DoubleToString(o_sl,5),
+               " TP=", DoubleToString(o_tp,5),
+               " Lot=", DoubleToString(o_lot,2));
+      g_state[i].day_date        = today;
+      g_state[i].day_processed   = true;
+      g_state[i].is_new_orb_shifted = false; // placeholder
+
+      g_state[i].orb_high        = orb_h;
+      g_state[i].orb_low         = orb_l;
+      g_state[i].orb_mark_shift  = orb_shift;
+      g_state[i].have_breakout   = true;
+      g_state[i].breakout_side   = side;
+      g_state[i].breakout_time   = bo_time;
+      g_state[i].breakout_input_price = in_price;
+
+      g_state[i].primary_active  = true;
+      g_state[i].primary_entry   = p_entry;
+      g_state[i].primary_sl      = p_sl;
+      g_state[i].primary_tp      = p_tp;
+      g_state[i].primary_lot     = p_lot;
+
+      if(InpEnableOpposite)
+        {
+         g_state[i].opp_active   = true;
+         g_state[i].opp_entry    = o_entry;
+         g_state[i].opp_sl       = o_sl;
+         g_state[i].opp_tp       = o_tp;
+         g_state[i].opp_lot      = o_lot;
+        }
+      else
+        {
+         g_state[i].opp_active   = false;
+        }
+
+      g_state[i].primary_filled  = false;
+      g_state[i].opp_filled      = false;
+     }
+
+   // Phase 2: candle-touch execution
+   for(int i=0;i<ArraySize(g_symbols);i++)
+     {
+      string sym = g_symbols[i];
+      if(sym=="") continue;
+      if(g_state[i].day_date!=today) continue;
+
+      if(g_state[i].primary_filled || g_state[i].opp_filled)
+         continue;
+      
+            Print("CHECK WINDOW ", sym,
+            " now=", TimeToString(now, TIME_MINUTES),
+            " day=", TimeToString(g_state[i].day_date, TIME_DATE));
+      if(!InEntryWindow(now,g_state[i].day_date))
+         continue;
+
+      // Primary check
+      if(g_state[i].primary_active)
+        {
+         int side = (g_state[i].primary_tp>g_state[i].primary_entry)?+1:-1;
+         double actual_entry = CheckAtrBufferTouch(sym,0,
+                                                   g_state[i].primary_entry,
+                                                   side,
+                                                   g_state[i].is_new_orb_shifted);
+      
+         Print("TOUCH CHECK ", sym, " PRIMARY side=", side>0?"B":"S",
+               " entry=", DoubleToString(g_state[i].primary_entry,5),
+               " actual=", DoubleToString(actual_entry,5));
+      
+         if(actual_entry>0.0)
+           {
+            if(OpenMarket(sym,side,g_state[i].primary_lot,
+                          g_state[i].primary_sl,
+                          g_state[i].primary_tp))
+              {
+               g_state[i].primary_filled = true;
+               g_state[i].opp_active     = false; // opposite disable
+              }
+            continue;
+           }
+        }
+
+      // Opposite check
+      if(InpEnableOpposite && g_state[i].opp_active)
+        {
+         int side = (g_state[i].opp_tp>g_state[i].opp_entry)?+1:-1;
+         double actual_entry = CheckAtrBufferTouch(sym,0,
+                                                   g_state[i].opp_entry,
+                                                   side,
+                                                   g_state[i].is_new_orb_shifted);
+         Print("TOUCH CHECK ", sym, " OPP side=", side>0?"B":"S",
+         " entry=", DoubleToString(g_state[i].opp_entry,5),
+         " actual=", DoubleToString(actual_entry,5));
+
+         if(actual_entry>0.0)
+           {
+            if(OpenMarket(sym,side,g_state[i].opp_lot,
+                          g_state[i].opp_sl,
+                          g_state[i].opp_tp))
+              {
+               g_state[i].opp_filled     = true;
+               g_state[i].primary_active = false;
+             }
+           }
+        }
+     }
+  }
+//+------------------------------------------------------------------+
