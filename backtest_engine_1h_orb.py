@@ -794,6 +794,91 @@ class BacktestEngine1HORB:
 
         return None
 
+    def _wait_for_first_fill_in_window(
+        self,
+        day_df: pd.DataFrame,
+        buy_setup: Dict,
+        sell_setup: Dict,
+        bo_time: datetime,
+        is_new_orb_shifted: bool = False,
+    ) -> Optional[Dict]:
+        """
+        Breakout ke baad buy/sell dono entries ko race mode me watch karo.
+        Jo side pehle fill ho wahi actual trade.
+        Agar dono same H1 candle me fill ho jayein, M1 se first touch decide karne ki koshish karo.
+        """
+        buy_result = self._wait_for_entry_in_window(
+            day_df, buy_setup, bo_time, is_new_orb_shifted
+        )
+        sell_result = self._wait_for_entry_in_window(
+            day_df, sell_setup, bo_time, is_new_orb_shifted
+        )
+
+        if not buy_result and not sell_result:
+            return None
+
+        if buy_result and not sell_result:
+            return {"setup": buy_setup, "entry_result": buy_result}
+
+        if sell_result and not buy_result:
+            return {"setup": sell_setup, "entry_result": sell_result}
+
+        buy_time = buy_result["entry_time"]
+        sell_time = sell_result["entry_time"]
+
+        if buy_time < sell_time:
+            return {"setup": buy_setup, "entry_result": buy_result}
+
+        if sell_time < buy_time:
+            return {"setup": sell_setup, "entry_result": sell_result}
+
+        # Same H1 candle fill on both sides -> try M1 tie-break
+        from_time = buy_time
+        to_time = buy_time + timedelta(hours=1)
+
+        try:
+            from live_data_mt5 import fetch_live_1m
+            m1_df = fetch_live_1m(self.pair, from_time, to_time)
+
+            if not m1_df.empty:
+                m1_df["time"] = pd.to_datetime(m1_df["time"])
+                mask = (m1_df["time"] >= from_time) & (
+                    m1_df["time"] <= to_time)
+                m1_df = m1_df.loc[mask].sort_values(
+                    "time").reset_index(drop=True)
+
+                for _, row in m1_df.iterrows():
+                    buy_hit = row["high"] >= buy_setup["entry"]
+                    sell_hit = row["low"] <= sell_setup["entry"]
+
+                    if buy_hit and not sell_hit:
+                        return {"setup": buy_setup, "entry_result": buy_result}
+
+                    if sell_hit and not buy_hit:
+                        return {"setup": sell_setup, "entry_result": sell_result}
+
+                    if buy_hit and sell_hit:
+                        # same M1 candle ambiguity -> conservative fallback
+                        # current fallback: choose side with smaller distance from candle open
+                        open_price = row["open"]
+                        buy_dist = abs(buy_setup["entry"] - open_price)
+                        sell_dist = abs(open_price - sell_setup["entry"])
+
+                        if buy_dist <= sell_dist:
+                            return {"setup": buy_setup, "entry_result": buy_result}
+                        else:
+                            return {"setup": sell_setup, "entry_result": sell_result}
+
+        except Exception as e:
+            print(
+                YELLOW
+                + f"  -> Same-candle dual-fill M1 tie-break failed ({e}), defaulting to earlier listed side"
+                + RESET
+            )
+
+        # fallback if same timestamp and M1 unavailable
+        return {"setup": buy_setup, "entry_result": buy_result}
+
     # ------------------ TRADE SIMULATION (MULTI-DAY) ------------------
     def _simulate_trade(
         self,
@@ -915,20 +1000,30 @@ class BacktestEngine1HORB:
                 to_time = entry_time + timedelta(hours=1)
 
                 try:
-                    from live_data_mt5 import fetch_live_1m  # agar alag file me hai
+                    from live_data_mt5 import fetch_live_1m
                     m1_df = fetch_live_1m(self.pair, from_time, to_time)
+
                     if not m1_df.empty:
                         m1_df["time"] = pd.to_datetime(m1_df["time"])
                         mask = (m1_df["time"] >= from_time) & (
                             m1_df["time"] <= to_time)
                         m1_df = m1_df.loc[mask]
+
+                    m1_fetch_ok = True
+
                 except Exception as e:
                     print(
-                        YELLOW + f"  -> M1 fetch failed ({e}), keeping H1 result as-is" + RESET)
+                        YELLOW +
+                        f"  -> M1 fetch failed ({e}), keeping H1 result as-is" + RESET
+                    )
                     m1_df = pd.DataFrame()
+                    m1_fetch_ok = False
 
                 confirmed = False
-                if not m1_df.empty:
+
+                if not m1_fetch_ok:
+                    confirmed = True
+                elif not m1_df.empty:
                     m1_high = m1_df["high"].max()
                     m1_low = m1_df["low"].min()
 
@@ -944,14 +1039,12 @@ class BacktestEngine1HORB:
                             confirmed = (m1_low <= tp)
 
                 if not confirmed:
-                    # 1m pe level touch nahi hua -> is candle ka hit ignore karo
                     print(
                         YELLOW
                         + f"  -> M1 did NOT confirm {hit_type.upper()} on same candle, keeping trade open"
                         + RESET
                     )
                     result = "session_exit"
-                    # trade continue kare next H1 candle pe
                 else:
                     print(
                         GREEN
@@ -1075,39 +1168,33 @@ class BacktestEngine1HORB:
             risk_percent = self.base_risk_percent + (week_num - 1)
             print(f"  -> Week {week_num}: Risk={risk_percent:.1f}%")
 
-            # Dual-side setups (same StrategyCalculator)
-            if breakout["side"] == "B":
-                primary = StrategyCalculator.get_buy_bo_primary(
-                    gann_levels, fund, risk_percent, pair=self.pair
-                )
-                opposite = StrategyCalculator.get_buy_bo_opp_sell(
-                    gann_levels, fund, risk_percent, pair=self.pair
-                )
-                primary["side"] = "B"
-                opposite["side"] = "S"
-            else:
-                primary = StrategyCalculator.get_sell_bo_primary(
-                    gann_levels, fund, risk_percent, pair=self.pair
-                )
-                opposite = StrategyCalculator.get_sell_bo_opp_buy(
-                    gann_levels, fund, risk_percent, pair=self.pair
-                )
-                primary["side"] = "S"
-                opposite["side"] = "B"
+            # Breakout sirf Gann trigger ke liye hai, side force nahi karega
+            buy_setup = StrategyCalculator.get_buy_bo_primary(
+                gann_levels, fund, risk_percent, pair=self.pair
+            )
+            sell_setup = StrategyCalculator.get_sell_bo_primary(
+                gann_levels, fund, risk_percent, pair=self.pair
+            )
+
+            buy_setup["side"] = "B"
+            sell_setup["side"] = "S"
+
+            primary = buy_setup
+            opposite = sell_setup
 
             print(
-                f"  -> PRIMARY {primary['side']} Entry={primary['entry']:.5f}, "
-                f"SL={primary['sl']:.5f}, TP={primary['tp']:.5f}, Lot={primary['lot_size']:.2f}"
+                f"  -> BUY  Entry={buy_setup['entry']:.5f}, "
+                f"SL={buy_setup['sl']:.5f}, TP={buy_setup['tp']:.5f}, Lot={buy_setup['lot_size']:.2f}"
             )
             print(
-                f"  -> OPP     {opposite['side']} Entry={opposite['entry']:.5f}, "
-                f"SL={opposite['sl']:.5f}, TP={opposite['tp']:.5f}, Lot={opposite['lot_size']:.2f}"
+                f"  -> SELL Entry={sell_setup['entry']:.5f}, "
+                f"SL={sell_setup['sl']:.5f}, TP={sell_setup['tp']:.5f}, Lot={sell_setup['lot_size']:.2f}"
             )
 
             # Do for both legs, but agar ek side fill ho jaye to dusri skip
             any_filled = False
 
-            for setup in (primary, opposite):
+            for setup in (buy_setup, sell_setup):
                 # Agar pehle hi koi trade fill ho chuka hai, dusri side skip
                 if any_filled:
                     print(
@@ -1331,50 +1418,82 @@ class BacktestEngine1HORB:
                         day_df, setup, breakout["bo_time"], is_new_orb_shifted
                     )
 
-                    if not entry_result:
-                        print(
-                            f"  -> {setup['side']} pending not filled till 19:30 IST "
-                            f"(order_expired_1930)"
-                        )
-                        self.trades.append(
-                            {
-                                "date": day,
-                                "pair": self.pair,
-                                "side": setup["side"],
-                                "entry_time": None,
-                                "entry_price": setup["entry"],
-                                "sl": setup["sl"],
-                                "tp": setup["tp"],
-                                "exit_time": None,
-                                "exit_price": None,
-                                "result": "order_expired_1930",
-                                "pnl_pips": 0.0,
-                                "pnl_amount": 0.0,
-                                "fund_after": round(self.current_fund, 2),
-                            }
-                        )
-                        self.total_trades += 1
-                        continue
+                    # Breakout sirf Gann trigger hai, side force nahi karega
+            buy_setup = StrategyCalculator.get_buy_bo_primary(
+                gann_levels, fund, risk_percent, pair=self.pair
+            )
+            sell_setup = StrategyCalculator.get_sell_bo_primary(
+                gann_levels, fund, risk_percent, pair=self.pair
+            )
 
-                    any_filled = True
+            buy_setup["side"] = "B"
+            sell_setup["side"] = "S"
 
-                    print(
-                        f"  -> {setup['side']} Entry filled at {entry_result['entry_time']}, "
-                        f"price={entry_result['actual_entry']:.5f}"
+            print(
+                f"  -> BUY  Entry={buy_setup['entry']:.5f}, "
+                f"SL={buy_setup['sl']:.5f}, TP={buy_setup['tp']:.5f}, Lot={buy_setup['lot_size']:.2f}"
+            )
+            print(
+                f"  -> SELL Entry={sell_setup['entry']:.5f}, "
+                f"SL={sell_setup['sl']:.5f}, TP={sell_setup['tp']:.5f}, Lot={sell_setup['lot_size']:.2f}"
+            )
+
+            fill = self._wait_for_first_fill_in_window(
+                day_df,
+                buy_setup,
+                sell_setup,
+                breakout["bo_time"],
+                is_new_orb_shifted,
+            )
+
+            if not fill:
+                print(
+                    "  -> Neither BUY nor SELL entry filled till expiry (order_expired_1930)")
+
+                for setup in (buy_setup, sell_setup):
+                    self.trades.append(
+                        {
+                            "date": day,
+                            "pair": self.pair,
+                            "side": setup["side"],
+                            "entry_time": None,
+                            "entry_price": setup["entry"],
+                            "sl": setup["sl"],
+                            "tp": setup["tp"],
+                            "exit_time": None,
+                            "exit_price": None,
+                            "result": "order_expired_1930",
+                            "pnl_pips": 0.0,
+                            "pnl_amount": 0.0,
+                            "fund_after": round(self.current_fund, 2),
+                        }
                     )
+                    self.total_trades += 1
+                continue
 
-                    trade = self._simulate_trade(
-                        data_by_pair[pair],  # full df of this pair
-                        setup,
-                        entry_result["entry_idx"],
-                        entry_result["actual_entry"],
-                    )
+            chosen_setup = fill["setup"]
+            entry_result = fill["entry_result"]
+            skipped_side = "S" if chosen_setup["side"] == "B" else "B"
 
-                    print(
-                        f"  -> {setup['side']} Exit {trade['result']} at {trade['exit_time']}, "
-                        f"price={trade['exit_price']:.5f}, "
-                        f"PNL=${trade['pnl_amount']:.2f}, Fund=${trade['fund_after']:.2f}"
-                    )
+            print(
+                f"  -> {chosen_setup['side']} Entry filled FIRST at {entry_result['entry_time']}, "
+                f"price={entry_result['actual_entry']:.5f}"
+            )
+            print(
+                f"  -> {skipped_side} leg skipped because opposite side already filled first")
+
+            trade = self._simulate_trade(
+                df,
+                chosen_setup,
+                entry_result["entry_idx"],
+                entry_result["actual_entry"],
+            )
+
+            print(
+                f"  -> {chosen_setup['side']} Exit {trade['result']} at {trade['exit_time']}, "
+                f"price={trade['exit_price']:.5f}, "
+                f"PNL=${trade['pnl_amount']:.2f}, Fund=${trade['fund_after']:.2f}"
+            )
 
         # Win rate
         wins = sum(1 for t in self.trades if t["result"] == "tp")
