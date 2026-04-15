@@ -227,6 +227,8 @@ class BacktestEngine1HORB:
     def _validate_day(self, day_df: pd.DataFrame) -> bool:
         """
         Check: 00:00 candle exists and ATR available.
+        Agar 00:00 par ATR NaN/zero ho, lekin day ke kisi aur candle par
+        valid ATR aa raha ho, to day KO VALID MANA JAYEGA.
         Naye ORB rules alag se chalenge.
         """
         if day_df.empty:
@@ -244,8 +246,21 @@ class BacktestEngine1HORB:
         first_atr = row.get("atr", np.nan)
 
         if pd.isna(first_atr) or first_atr <= 0:
-            print("  -> ATR not available/zero at 00:00 candle (skipping)")
-            return False
+            # 00:00 par ATR nahi, lekin agar day ke andar kahin bhi
+            # valid ATR mil raha hai to warm-up ke chakkar me
+            # pura day skip mat karo.
+            any_valid_atr = day_df["atr"].dropna()
+            any_valid_atr = any_valid_atr[any_valid_atr > 0]
+
+            if any_valid_atr.empty:
+                print("  -> ATR not available/zero for entire day (skipping)")
+                return False
+
+            print(
+                "  -> ATR not available/zero at 00:00 candle, "
+                "but later in day ATR exists -> accepting day"
+            )
+            return True
 
         return True
 
@@ -763,7 +778,8 @@ class BacktestEngine1HORB:
         )
 
         mask = (day_df["time"] >= entry_start_server) & (
-            day_df["time"] < expire_server)
+            day_df["time"] < expire_server
+        )
         search_df = day_df.loc[mask]
 
         if search_df.empty:
@@ -1355,9 +1371,9 @@ class BacktestEngine1HORB:
         """
         specs: list of dicts:
         [
-          {"pair": "EURAUD.raw", "csv": "EURAUD_H1.csv"},
-          {"pair": "GBPAUD.raw", "csv": "GBPAUD_H1.csv"},
-          ...
+        {"pair": "EURAUD.raw", "csv": "EURAUD_H1.csv"},
+        {"pair": "GBPAUD.raw", "csv": "GBPAUD_H1.csv"},
+        ...
         ]
         Shared fund across all pairs.
 
@@ -1368,6 +1384,9 @@ class BacktestEngine1HORB:
         # 1) Sare CSV load + date range collect
         data_by_pair = {}
         all_dates = set()
+
+        # Day-wise summary list
+        self.daily_briefings = []
 
         for spec in specs:
             pair = spec["pair"]
@@ -1402,6 +1421,12 @@ class BacktestEngine1HORB:
         for day in all_dates:
             print("\n" + "=" * 60)
             print(f"PROCESSING DAY: {day}")
+
+            day_open_balance = self.current_fund
+            day_profit = 0.0
+            day_trade_count = 0
+            day_tp_hits = 0
+            day_risk_percent = None
 
             for pair, df in data_by_pair.items():
                 # Global stop check
@@ -1473,6 +1498,7 @@ class BacktestEngine1HORB:
                     week_num = 1
 
                 risk_percent = self.base_risk_percent + (week_num - 1)
+                day_risk_percent = risk_percent
                 print(f"  -> Week {week_num}: Risk={risk_percent:.1f}%")
 
                 # Breakout sirf Gann trigger hai, side force nahi karega
@@ -1563,6 +1589,12 @@ class BacktestEngine1HORB:
                     f"PNL=${trade['pnl_amount']:.2f}, Fund=${trade['fund_after']:.2f}"
                 )
 
+                # Day counters
+                day_trade_count += 1
+                day_profit += trade["pnl_amount"]
+                if trade["result"] == "tp":
+                    day_tp_hits += 1
+
                 # Agar fund 0 ya neeche chala gaya, global stop
                 if getattr(self, "stop_requested", False):
                     print(
@@ -1571,6 +1603,19 @@ class BacktestEngine1HORB:
                         + RESET
                     )
                     break  # pair loop se bahar
+
+            # Day-wise briefing capture
+            self.daily_briefings.append(
+                {
+                    "date": day,
+                    "open_balance": round(day_open_balance, 2),
+                    "risk_percent": round(day_risk_percent, 2) if day_risk_percent is not None else 0.0,
+                    "no_trades": day_trade_count,
+                    "tp_hits": day_tp_hits,
+                    "profit": round(day_profit, 2),
+                    "final_balance": round(self.current_fund, 2),
+                }
+            )
 
             # outer day loop ke liye stop check
             if getattr(self, "stop_requested", False):
@@ -1586,6 +1631,40 @@ class BacktestEngine1HORB:
             f"\nTOTAL TRADES: {self.total_trades}, "
             f"WINS (TP): {wins}, LOSSES (SL): {losses}"
         )
+
+        # Final fund numeric + words
+        print(
+            f"FINAL FUND: ${self.current_fund:,.2f} "
+            f"({self._human_amount(self.current_fund)})"
+        )
+
+        # Day-wise briefing
+        print("\n=== DAY WISE BRIEFING ===")
+        for idx, d in enumerate(self.daily_briefings, start=1):
+            print(
+                f"Day: {idx} | Date: {d['date']} | "
+                f"Open Bal: ${d['open_balance']:,.2f} | "
+                f"Risk%: {d['risk_percent']:.2f}% | "
+                f"No Trades: {d['no_trades']} | "
+                f"TP Hits: {d['tp_hits']} | "
+                f"Profit: ${d['profit']:,.2f} | "
+                f"Final Balance: ${d['final_balance']:,.2f}"
+            )
+
+    def _human_amount(self, n: float) -> str:
+        n = float(n)
+        abs_n = abs(n)
+
+        if abs_n >= 1_000_000_000_000:
+            return f"{n / 1_000_000_000_000:.2f} trillion"
+        elif abs_n >= 1_000_000_000:
+            return f"{n / 1_000_000_000:.2f} billion"
+        elif abs_n >= 1_000_000:
+            return f"{n / 1_000_000:.2f} million"
+        elif abs_n >= 1_000:
+            return f"{n / 1_000:.2f} thousand"
+        else:
+            return f"{n:.2f}"
 
     def generate_signal_for_latest_day(self, pair: str, df_1h: pd.DataFrame):
         """
@@ -1670,7 +1749,6 @@ class BacktestEngine1HORB:
             "lot": primary["lot_size"],
         }
 
-    def export_to_excel(self, output_path: str) -> None:
         folder = "backtests"
         os.makedirs(folder, exist_ok=True)
         full_path = os.path.join(folder, os.path.basename(output_path))
@@ -1720,5 +1798,166 @@ class BacktestEngine1HORB:
                 trades_df.to_excel(writer, sheet_name="Trades", index=False)
             summary_df = pd.DataFrame(summary)
             summary_df.to_excel(writer, sheet_name="Summary", index=False)
+
+        print(f"\nBacktest results exported to: {full_path}")
+
+    def generate_live_dual_signal_for_latest_day(self, pair: str, df_1h: pd.DataFrame):
+        self.pair = pair
+
+        df = df_1h.copy()
+        df["time"] = pd.to_datetime(df["datetime"])
+        df = df.sort_values("time").reset_index(drop=True)
+
+        df = self._add_atr_column(df)
+
+        day = df["time"].dt.date.max()
+        day_df = df[df["time"].dt.date == day]
+
+        print(f"\n[Dual Signal] {pair} latest day = {day}")
+        print(f"  -> Rows in day_df: {len(day_df)}")
+
+        if not self._validate_day(day_df):
+            print("  -> Day invalid, no signal")
+            return None
+
+        orb_info = self._decide_orb(day_df)
+        orb = orb_info["orb"]
+        breakout = orb_info["breakout"]
+        is_new_orb_shifted = orb_info.get("is_new_orb_shifted", False)
+
+        if not orb or not breakout:
+            print("  -> No ORB/breakout, no dual signal")
+            return None
+
+        print(f"  -> Gann INPUT price: {breakout['input_price']:.5f}")
+
+        gann_levels = self._get_gann_from_lookup(breakout["input_price"])
+        if not gann_levels:
+            print("  -> Gann lookup failed, no signal")
+            return None
+
+        fund = self.current_fund
+        risk_percent = self.base_risk_percent
+
+        market_type = self._infer_market_type(day_df)
+        expire_ist = self._get_entry_expire_time(day, market_type)
+        expire_server_dt = DSTHelper.ist_to_server(
+            datetime.combine(day, expire_ist))
+
+        if breakout["side"] == "B":
+            buy_setup = StrategyCalculator.get_buy_bo_primary(
+                gann_levels, fund, risk_percent, pair=self.pair
+            )
+            sell_setup = StrategyCalculator.get_buy_bo_opp_sell(
+                gann_levels, fund, risk_percent, pair=self.pair
+            )
+        else:
+            sell_setup = StrategyCalculator.get_sell_bo_primary(
+                gann_levels, fund, risk_percent, pair=self.pair
+            )
+            buy_setup = StrategyCalculator.get_sell_bo_opp_buy(
+                gann_levels, fund, risk_percent, pair=self.pair
+            )
+
+        buy_setup["side"] = "B"
+        sell_setup["side"] = "S"
+
+        print(
+            f"  -> BUY  Entry={buy_setup['entry']:.5f}, "
+            f"SL={buy_setup['sl']:.5f}, TP={buy_setup['tp']:.5f}, Lot={buy_setup['lot_size']:.2f}"
+        )
+        print(
+            f"  -> SELL Entry={sell_setup['entry']:.5f}, "
+            f"SL={sell_setup['sl']:.5f}, TP={sell_setup['tp']:.5f}, Lot={sell_setup['lot_size']:.2f}"
+        )
+
+        return {
+            "day": day,
+            "breakout_side": breakout["side"],
+            "market_type": market_type,
+            "expiry_ist": expire_ist.strftime("%H:%M:%S"),
+            "expiry_server": expire_server_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "buy": {
+                "entry": buy_setup["entry"],
+                "sl": buy_setup["sl"],
+                "tp": buy_setup["tp"],
+                "lot": buy_setup["lot_size"],
+            },
+            "sell": {
+                "entry": sell_setup["entry"],
+                "sl": sell_setup["sl"],
+                "tp": sell_setup["tp"],
+                "lot": sell_setup["lot_size"],
+            },
+            "is_new_orb_shifted": is_new_orb_shifted,
+        }
+
+    def export_to_excel(self, output_path: str) -> None:
+        folder = "backtests"
+        os.makedirs(folder, exist_ok=True)
+        full_path = os.path.join(folder, os.path.basename(output_path))
+
+        total_trades = len(self.trades)
+        net_pnl = self.current_fund - self.initial_fund
+
+        # Result counts
+        wins = sum(1 for t in self.trades if t["result"] == "tp")
+        losses = sum(1 for t in self.trades if t["result"] == "sl")
+        expired = sum(
+            1 for t in self.trades if t["result"] == "order_expired_1930")
+        others = total_trades - (wins + losses + expired)
+
+        summary = {
+            "Metric": [
+                "Initial Fund",
+                "Final Fund",
+                "Final Fund (words)",
+                "Net PNL",
+                "Total Records",
+                "Win Rate (TP only)",
+                "Max Drawdown",
+                "Total Trades",
+                "Wins (TP)",
+                "Losses (SL)",
+                "Expired Orders",
+                "Other Results",
+            ],
+            "Value": [
+                self.initial_fund,
+                self.current_fund,
+                self._human_amount(self.current_fund),
+                net_pnl,
+                total_trades,
+                f"{self.win_rate:.2f}%" if total_trades > 0 else "N/A",
+                self.max_drawdown,
+                total_trades,
+                wins,
+                losses,
+                expired,
+                others,
+            ],
+        }
+
+        with pd.ExcelWriter(full_path, engine="openpyxl") as writer:
+            if self.trades:
+                trades_df = pd.DataFrame(self.trades)
+                trades_df.to_excel(writer, sheet_name="Trades", index=False)
+
+            summary_df = pd.DataFrame(summary)
+            summary_df.to_excel(writer, sheet_name="Summary", index=False)
+
+            if hasattr(self, "daily_briefings") and self.daily_briefings:
+                daily_df = pd.DataFrame(self.daily_briefings)
+                daily_df.columns = [
+                    "Date",
+                    "Open Balance",
+                    "Risk %",
+                    "No Trades",
+                    "TP Hits",
+                    "Profit",
+                    "Final Balance",
+                ]
+                daily_df.to_excel(
+                    writer, sheet_name="Day Wise Briefing", index=False)
 
         print(f"\nBacktest results exported to: {full_path}")

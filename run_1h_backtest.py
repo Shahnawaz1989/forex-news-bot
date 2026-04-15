@@ -9,8 +9,8 @@ BACKTEST / LIVE CHECK CONFIGURATION
 """
 
 # Date Range (MT5 data ke andar se filter)
-START_DATE = "2026-03-23"   # YYYY-MM-DD
-END_DATE = "2026-04-11"   # YYYY-MM-DD
+START_DATE = "2026-04-15"   # YYYY-MM-DD
+END_DATE = "2026-04-15"   # YYYY-MM-DD
 
 # Trading Parameters
 INITIAL_FUND = 30.0         # Starting capital in dollars
@@ -18,6 +18,7 @@ INITIAL_RISK = 8.0          # Risk percentage per trade
 
 # Multi-pair list
 PAIRS = [
+    "AUDCAD.raw",
     "AUDUSD.raw",
     "EURAUD.raw",
     "EURCAD.raw",
@@ -28,6 +29,7 @@ PAIRS = [
     "GBPUSD.raw",
     "NZDCAD.raw",
     "NZDUSD.raw",
+
 ]
 
 
